@@ -20,11 +20,12 @@ function App() {
   const [account, setAccount] = useState("");
   const [contract, setContract] = useState(null);
   const [logs, setLogs] = useState([
-    { timestamp: new Date().toLocaleTimeString(), text: "System initialized. Please connect your Web3 wallet.", type: "info" }
+    { timestamp: new Date().toLocaleTimeString(), text: "Ready. Connect your wallet to get started.", type: "info" }
   ]);
-  const [providers, setProviders] = useState([]);
+  const [walletProviders, setWalletProviders] = useState([]);
+  const [showWalletPicker, setShowWalletPicker] = useState(false);
+  const [theme, setTheme] = useState(() => localStorage.getItem('agentpayos-theme') || 'dark');
 
-  // Form States
   const [serviceName, setServiceName] = useState("Weather Telemetry API");
   const [servicePrice, setServicePrice] = useState("1000000");
   const [tokenAddress, setTokenAddress] = useState("0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d");
@@ -37,6 +38,15 @@ function App() {
   const [payUserAddress, setPayUserAddress] = useState("");
   const [payServiceID, setPayServiceID] = useState("");
 
+  const [activeTab, setActiveTab] = useState("dashboard");
+  const [registeredServices, setRegisteredServices] = useState([]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [fetchingServices, setFetchingServices] = useState(false);
+
+  const [activityStats, setActivityStats] = useState({ totalPayments: 0, totalVolume: 0, uniqueUsers: 0, uniqueProviders: 0, totalServices: 0 });
+  const [recentTxns, setRecentTxns] = useState([]);
+  const [fetchingActivity, setFetchingActivity] = useState(false);
+
   const [loading, setLoading] = useState(false);
   const consoleEndRef = useRef(null);
 
@@ -45,355 +55,453 @@ function App() {
   };
 
   useEffect(() => {
-    if (consoleEndRef.current) {
-      consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('agentpayos-theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+
+  const fetchRegisteredServices = async (ci) => {
+    const c = ci || contract;
+    if (!c) return;
+    try {
+      setFetchingServices(true);
+      addLog("Querying on-chain service registry...", "info");
+      const filter = c.filters.ServiceRegistered();
+      const events = await c.queryFilter(filter, 282600000);
+      const parsed = events.map(evt => ({
+        serviceId: evt.args.service_id,
+        provider: evt.args.provider,
+        token: evt.args.token,
+        name: evt.args.name,
+        price: evt.args.price.toString(),
+        url: evt.args.url,
+        blockNumber: evt.blockNumber
+      }));
+      parsed.sort((a, b) => b.blockNumber - a.blockNumber);
+      setRegisteredServices(parsed);
+      addLog(`Found ${parsed.length} registered services.`, "success");
+    } catch (err) {
+      addLog(`Registry query failed: ${err.message}`, "error");
+    } finally {
+      setFetchingServices(false);
     }
+  };
+
+  const filteredServices = registeredServices.filter(s => {
+    const q = searchQuery.toLowerCase();
+    return s.name.toLowerCase().includes(q) || s.serviceId.toLowerCase().includes(q) || s.provider.toLowerCase().includes(q);
+  });
+
+  const fetchActivity = async (ci) => {
+    const c = ci || contract;
+    if (!c) return;
+    try {
+      setFetchingActivity(true);
+      const startBlock = 282600000;
+
+      const [payments, approvals, registrations] = await Promise.all([
+        c.queryFilter(c.filters.PaymentProcessed(), startBlock),
+        c.queryFilter(c.filters.AgentApproved(), startBlock),
+        c.queryFilter(c.filters.ServiceRegistered(), startBlock),
+      ]);
+
+      const users = new Set();
+      const providers = new Set();
+      let volume = 0n;
+
+      payments.forEach(e => {
+        users.add(e.args.user.toLowerCase());
+        providers.add(e.args.provider.toLowerCase());
+        volume += e.args.amount;
+      });
+      registrations.forEach(e => providers.add(e.args.provider.toLowerCase()));
+      approvals.forEach(e => users.add(e.args.user.toLowerCase()));
+
+      setActivityStats({
+        totalPayments: payments.length,
+        totalVolume: Number(volume) / 1e6,
+        uniqueUsers: users.size,
+        uniqueProviders: providers.size,
+        totalServices: registrations.length,
+      });
+
+      // Build unified timeline
+      const allTxns = [
+        ...payments.map(e => ({ type: 'payment', hash: e.transactionHash, block: e.blockNumber, from: e.args.user, to: e.args.provider, amount: (Number(e.args.amount) / 1e6).toFixed(2), serviceId: e.args.service_id })),
+        ...approvals.map(e => ({ type: 'approval', hash: e.transactionHash, block: e.blockNumber, from: e.args.user, to: e.args.agent, amount: (Number(e.args.allowance) / 1e6).toFixed(2) })),
+        ...registrations.map(e => ({ type: 'registration', hash: e.transactionHash, block: e.blockNumber, from: e.args.provider, name: e.args.name })),
+      ];
+      allTxns.sort((a, b) => b.block - a.block);
+      setRecentTxns(allTxns.slice(0, 50));
+
+      addLog(`Activity loaded: ${payments.length} payments, ${approvals.length} approvals, ${registrations.length} registrations.`, "success");
+    } catch (err) {
+      addLog(`Activity fetch failed: ${err.message}`, "error");
+    } finally {
+      setFetchingActivity(false);
+    }
+  };
+
+  useEffect(() => {
+    if (consoleEndRef.current) consoleEndRef.current.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   useEffect(() => {
     const handleAnnounce = (event) => {
       const { info, provider } = event.detail;
-      setProviders(prev => {
-        if (prev.some(p => p.info.uuid === info.uuid)) return prev;
-        return [...prev, { info, provider }];
-      });
+      setWalletProviders(prev => prev.some(p => p.info.uuid === info.uuid) ? prev : [...prev, { info, provider }]);
     };
-
     window.addEventListener("eip6963:announceProvider", handleAnnounce);
     window.dispatchEvent(new Event("eip6963:requestProvider"));
-
-    return () => {
-      window.removeEventListener("eip6963:announceProvider", handleAnnounce);
-    };
+    return () => window.removeEventListener("eip6963:announceProvider", handleAnnounce);
   }, []);
 
-  const connectWallet = async (selectedProviderDetail) => {
-    let injectedProvider = selectedProviderDetail ? selectedProviderDetail.provider : window.ethereum;
-    if (!injectedProvider) {
-      addLog("No injected Web3 provider found. Please install MetaMask.", "error");
-      return;
-    }
-
+  const connectWallet = async (selectedDetail) => {
+    const injected = selectedDetail ? selectedDetail.provider : window.ethereum;
+    if (!injected) { addLog("No Web3 wallet found. Please install MetaMask.", "error"); return; }
     try {
       setLoading(true);
-      const walletName = selectedProviderDetail ? selectedProviderDetail.info.name : "Wallet";
-      addLog(`Requesting connection to ${walletName}...`, "info");
-      
-      const providerInstance = new ethers.BrowserProvider(injectedProvider);
-      await providerInstance.send("eth_requestAccounts", []);
-      const signer = await providerInstance.getSigner();
-      const walletAddress = await signer.getAddress();
-
-      const network = await providerInstance.getNetwork();
+      setShowWalletPicker(false);
+      const name = selectedDetail ? selectedDetail.info.name : "Wallet";
+      addLog(`Connecting to ${name}...`, "info");
+      const prov = new ethers.BrowserProvider(injected);
+      await prov.send("eth_requestAccounts", []);
+      const signer = await prov.getSigner();
+      const addr = await signer.getAddress();
+      const network = await prov.getNetwork();
       if (network.chainId !== 421614n) {
-        addLog("WARNING: You are not connected to Arbitrum Sepolia. Attempting to switch...", "error");
         try {
-          await injectedProvider.request({
-            method: "wallet_switchEthereumChain",
-            params: [{ chainId: "0x66eee" }],
-          });
-        } catch (switchError) {
-          addLog(`Please switch network manually in your wallet to Arbitrum Sepolia (421614).`, "error");
-          setLoading(false);
-          return;
-        }
+          await injected.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x66eee" }] });
+        } catch { addLog("Please switch to Arbitrum Sepolia manually.", "error"); setLoading(false); return; }
       }
+      const inst = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      setContract(inst); setAccount(addr);
+      addLog(`Connected: ${addr}`, "success");
+      fetchRegisteredServices(inst);
+    } catch (err) { addLog(`Connection failed: ${err.message}`, "error"); }
+    finally { setLoading(false); }
+  };
 
-      const instance = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      setContract(instance);
-      setAccount(walletAddress);
-      addLog(`Connected: ${walletAddress} via ${walletName}`, "success");
-    } catch (err) {
-      addLog(`Connection failed: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
+  const handleConnectClick = () => {
+    if (walletProviders.length <= 1) {
+      connectWallet(walletProviders[0] || null);
+    } else {
+      setShowWalletPicker(!showWalletPicker);
     }
   };
 
   const handleRegisterService = async () => {
-    if (!contract) {
-      addLog("Wallet not connected.", "error");
-      return;
-    }
-    if (!serviceName || !servicePrice || !tokenAddress || !serviceUrl) {
-      addLog("Please fill in all service registration inputs.", "error");
-      return;
-    }
-
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    if (!serviceName || !servicePrice || !tokenAddress || !serviceUrl) { addLog("Fill in all fields.", "error"); return; }
     try {
       setLoading(true);
       const price = ethers.toBigInt(servicePrice);
-      addLog(`Submitting registerService("${serviceName}", ${price}, ${tokenAddress}, "${serviceUrl}")...`, "info");
-      
+      addLog(`Registering "${serviceName}"...`, "info");
       const tx = await contract.registerService(serviceName, price, tokenAddress, serviceUrl, {
-        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
-        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"), maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
       });
-      addLog(`Transaction sent! Hash: ${tx.hash}`, "info");
-      
+      addLog(`Tx: ${tx.hash}`, "info");
       const receipt = await tx.wait();
-      addLog(`Transaction confirmed in block ${receipt.blockNumber}!`, "success");
-
-      const calculatedServiceID = ethers.solidityPackedKeccak256(
-        ["bytes", "address"],
-        [ethers.toUtf8Bytes(serviceName), account]
-      );
-      addLog(`Service ID Generated: ${calculatedServiceID}`, "success");
-      addLog(`Configure this Service ID in your Go Gateway environment.`, "info");
-    } catch (err) {
-      addLog(`Registration failed: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
-    }
+      addLog(`Confirmed in block ${receipt.blockNumber}`, "success");
+      const sid = ethers.solidityPackedKeccak256(["bytes", "address"], [ethers.toUtf8Bytes(serviceName), account]);
+      addLog(`Service ID: ${sid}`, "success");
+    } catch (err) { addLog(`Registration failed: ${err.message}`, "error"); }
+    finally { setLoading(false); }
   };
 
   const handleApproveAgent = async () => {
-    if (!contract) {
-      addLog("Wallet not connected.", "error");
-      return;
-    }
-    if (!agentAddress || !agentAllowance || !sessionDuration) {
-      addLog("Please fill in all agent session inputs.", "error");
-      return;
-    }
-
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    if (!agentAddress || !agentAllowance || !sessionDuration) { addLog("Fill in all fields.", "error"); return; }
     try {
       setLoading(true);
-      const allowance = ethers.toBigInt(agentAllowance);
-      const duration = ethers.toBigInt(sessionDuration);
-
-      addLog(`Submitting approveAgent(${agentAddress}, ${allowance}, ${duration})...`, "info");
-      const tx = await contract.approveAgent(agentAddress, allowance, duration, {
-        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
-        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+      addLog(`Approving agent ${agentAddress.substring(0,8)}...`, "info");
+      const tx = await contract.approveAgent(agentAddress, ethers.toBigInt(agentAllowance), ethers.toBigInt(sessionDuration), {
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"), maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
       });
-      addLog(`Transaction sent! Hash: ${tx.hash}`, "info");
-
+      addLog(`Tx: ${tx.hash}`, "info");
       await tx.wait();
-      addLog(`Agent session approved successfully!`, "success");
-
-      const sessionKey = ethers.solidityPackedKeccak256(
-        ["address", "address"],
-        [account, agentAddress]
-      );
-      addLog(`Calculated Session Key: ${sessionKey}`, "success");
-    } catch (err) {
-      addLog(`Agent approval failed: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
-    }
+      addLog("Agent session approved!", "success");
+      const key = ethers.solidityPackedKeccak256(["address", "address"], [account, agentAddress]);
+      addLog(`Session Key: ${key}`, "success");
+    } catch (err) { addLog(`Approval failed: ${err.message}`, "error"); }
+    finally { setLoading(false); }
   };
 
   const handlePayForService = async () => {
-    if (!contract) {
-      addLog("Wallet not connected.", "error");
-      return;
-    }
-    if (!payUserAddress || !payServiceID) {
-      addLog("Please fill in all simulator inputs.", "error");
-      return;
-    }
-
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    if (!payUserAddress || !payServiceID) { addLog("Fill in all fields.", "error"); return; }
     try {
       setLoading(true);
-      addLog(`Submitting payForService(${payUserAddress}, "${payServiceID}")...`, "info");
-      
+      addLog(`Paying for service...`, "info");
       const tx = await contract.payForService(payUserAddress, payServiceID, {
-        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
-        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"), maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
       });
-      addLog(`Transaction sent! Hash: ${tx.hash}`, "info");
-      
-      const receipt = await tx.wait();
-      addLog(`Payment transaction confirmed! Hash: ${tx.hash}`, "success");
-      addLog(`Copy this Tx Hash for your Gateway API request header: X-Payment-Tx-Hash`, "success");
-    } catch (err) {
-      addLog(`Payment failed: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
-    }
+      addLog(`Tx: ${tx.hash}`, "info");
+      await tx.wait();
+      addLog(`Payment confirmed! Use this Tx Hash in X-Payment-Tx-Hash header.`, "success");
+    } catch (err) { addLog(`Payment failed: ${err.message}`, "error"); }
+    finally { setLoading(false); }
   };
 
   const handleGenerateAgent = () => {
-    try {
-      const wallet = ethers.Wallet.createRandom();
-      setAgentAddress(wallet.address);
-      addLog(`Generated Random Agent Wallet:`, "success");
-      addLog(`Agent Address: ${wallet.address}`, "success");
-      addLog(`Agent Private Key: ${wallet.privateKey}`, "success");
-      addLog(`IMPORTANT: Copy and save this private key to run payments from your agent client.`, "info");
-    } catch (err) {
-      addLog(`Failed to generate agent: ${err.message}`, "error");
-    }
+    const w = ethers.Wallet.createRandom();
+    setAgentAddress(w.address);
+    addLog(`New Agent: ${w.address}`, "success");
+    addLog(`Private Key: ${w.privateKey}`, "success");
+    addLog("Save this private key for your agent client.", "info");
   };
 
   const handleApproveUSDC = async () => {
-    if (!account) {
-      addLog("Wallet not connected.", "error");
-      return;
-    }
-    if (!tokenAddress) {
-      addLog("Please enter the USDC Token Address in the registration form first.", "error");
-      return;
-    }
-
+    if (!account || !tokenAddress) { addLog("Connect wallet and set token address first.", "error"); return; }
     try {
       setLoading(true);
-      addLog(`Requesting approval for ${CONTRACT_ADDRESS} to spend USDC on token contract ${tokenAddress}...`, "info");
-      
-      const signerInstance = contract.runner;
-      
-      const erc20 = new ethers.Contract(
-        tokenAddress,
-        ["function approve(address spender, uint256 amount) external returns (bool)"],
-        signerInstance
-      );
-
-      const tx = await erc20.approve(CONTRACT_ADDRESS, ethers.toBigInt("10000000000"), { // 10,000 USDC
-        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
-        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+      const erc20 = new ethers.Contract(tokenAddress, ["function approve(address spender, uint256 amount) external returns (bool)"], contract.runner);
+      const tx = await erc20.approve(CONTRACT_ADDRESS, ethers.toBigInt("10000000000"), {
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"), maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
       });
-      addLog(`Approve transaction sent! Hash: ${tx.hash}`, "info");
-
+      addLog(`Approve tx: ${tx.hash}`, "info");
       await tx.wait();
-      addLog(`Successfully approved AgentPayOS contract to spend your USDC!`, "success");
-    } catch (err) {
-      addLog(`USDC approval failed: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
-    }
+      addLog("USDC spending approved!", "success");
+    } catch (err) { addLog(`Approval failed: ${err.message}`, "error"); }
+    finally { setLoading(false); }
+  };
+
+  const disconnectWallet = () => {
+    setAccount("");
+    setContract(null);
+    setRegisteredServices([]);
+    addLog("Wallet disconnected.", "info");
   };
 
   return (
     <div className="container">
       <header>
-        <h1>AgentPay OS <span className="badge">Arbitrum Stylus</span></h1>
-        <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
-          {account ? (
-            <button className="btn-secondary" disabled>
-              {`${account.substring(0, 6)}...${account.substring(38)}`}
-            </button>
-          ) : providers.length > 0 ? (
-            providers.map((p) => (
-              <button key={p.info.uuid} onClick={() => connectWallet(p)} className="btn-primary" disabled={loading}>
-                Connect {p.info.name}
-              </button>
-            ))
-          ) : (
-            <button onClick={() => connectWallet(null)} className="btn-primary" disabled={loading}>
-              Connect Wallet
-            </button>
-          )}
+        <div className="header-left">
+          <h1>AgentPayOS</h1>
+          <span className="badge">Arbitrum Stylus</span>
+        </div>
+        <div className="header-right">
+          <button className="theme-toggle" onClick={toggleTheme} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
+            {theme === 'dark' ? '☀️' : '🌙'}
+          </button>
+          <div className="wallet-area">
+            {account ? (
+              <>
+                <div className="wallet-connected">{account.substring(0, 6)}...{account.substring(38)}</div>
+                <button onClick={disconnectWallet} className="btn-ghost" title="Disconnect wallet" style={{ fontSize: '0.8rem', padding: '0.4rem 0.6rem' }}>Disconnect</button>
+              </>
+            ) : (
+              <>
+                <button onClick={handleConnectClick} className="btn-primary" disabled={loading}>
+                  Connect Wallet
+                </button>
+                {showWalletPicker && walletProviders.length > 1 && (
+                  <div className="wallet-dropdown">
+                    {walletProviders.map(p => (
+                      <button key={p.info.uuid} onClick={() => connectWallet(p)}>{p.info.name}</button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
         </div>
       </header>
 
-      <main className="grid">
-        <section className="card">
-          <h2>Register API Service</h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-            Register your API metadata on-chain to allow AI agents to settle micro-payments.
-          </p>
-          
-          <div className="form-group">
-            <label>Service Name</label>
-            <input type="text" value={serviceName} onChange={(e) => setServiceName(e.target.value)} />
-          </div>
+      <div className="tabs">
+        <button className={`tab-btn ${activeTab === "dashboard" ? "active" : ""}`} onClick={() => setActiveTab("dashboard")}>Console</button>
+        <button className={`tab-btn ${activeTab === "directory" ? "active" : ""}`} onClick={() => { setActiveTab("directory"); fetchRegisteredServices(); }}>Service Directory</button>
+        <button className={`tab-btn ${activeTab === "activity" ? "active" : ""}`} onClick={() => { setActiveTab("activity"); fetchActivity(); }}>Activity</button>
+      </div>
 
-          <div className="form-group">
-            <label>Price (in USDC units - 6 decimals)</label>
-            <input type="number" value={servicePrice} onChange={(e) => setServicePrice(e.target.value)} />
-          </div>
+      {activeTab === "dashboard" ? (
+        <main className="grid">
+          <section className="card">
+            <h2>Register Service</h2>
+            <p className="card-description">Register an API endpoint on-chain so agents can discover and pay for it.</p>
+            <div className="form-group">
+              <label>Service Name</label>
+              <input type="text" value={serviceName} onChange={e => setServiceName(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Price (USDC units, 6 decimals)</label>
+              <input type="number" value={servicePrice} onChange={e => setServicePrice(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Token Address</label>
+              <input type="text" value={tokenAddress} onChange={e => setTokenAddress(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>API Endpoint URL</label>
+              <input type="text" value={serviceUrl} onChange={e => setServiceUrl(e.target.value)} />
+            </div>
+            <button onClick={handleRegisterService} className="btn-primary" disabled={loading || !account}>Register Service</button>
+          </section>
 
-          <div className="form-group">
-            <label>Token Address (USDC)</label>
-            <input type="text" value={tokenAddress} onChange={(e) => setTokenAddress(e.target.value)} />
-          </div>
+          <section className="card">
+            <h2>Approve Agent Session</h2>
+            <p className="card-description">Grant a time-locked, budget-limited allowance to an agent wallet.</p>
+            <div className="form-group">
+              <label>Agent Address</label>
+              <div style={{ display: 'flex', gap: '0.5rem' }}>
+                <input type="text" value={agentAddress} onChange={e => setAgentAddress(e.target.value)} style={{ flex: 1 }} />
+                <button onClick={handleGenerateAgent} className="btn-secondary" style={{ whiteSpace: 'nowrap', fontSize: '0.75rem' }}>Generate</button>
+              </div>
+            </div>
+            <div className="form-group">
+              <label>Allowance (USDC units)</label>
+              <input type="number" value={agentAllowance} onChange={e => setAgentAllowance(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Duration (seconds)</label>
+              <input type="number" value={sessionDuration} onChange={e => setSessionDuration(e.target.value)} />
+            </div>
+            <button onClick={handleApproveAgent} className="btn-primary" disabled={loading || !account}>Approve Agent</button>
+            <button onClick={handleApproveUSDC} className="btn-secondary" disabled={loading || !account}>Approve USDC Spending</button>
+          </section>
 
-          <div className="form-group">
-            <label>API Endpoint URL</label>
-            <input type="text" value={serviceUrl} onChange={(e) => setServiceUrl(e.target.value)} />
-          </div>
+          <section className="card">
+            <h2>Simulate Agent Payment</h2>
+            <p className="card-description">Test the payForService call as an agent.</p>
+            <div className="form-group">
+              <label>User Address (Delegator)</label>
+              <input type="text" value={payUserAddress} onChange={e => setPayUserAddress(e.target.value)} placeholder="0x..." />
+            </div>
+            <div className="form-group">
+              <label>Service ID</label>
+              <input type="text" value={payServiceID} onChange={e => setPayServiceID(e.target.value)} placeholder="0x..." />
+            </div>
+            <button onClick={handlePayForService} className="btn-primary" disabled={loading || !account}>Trigger Payment</button>
+          </section>
 
-          <button onClick={handleRegisterService} className="btn-secondary" disabled={loading || !account}>
-            Register Service
-          </button>
-        </section>
-
-        <section className="card">
-          <h2>Approve AI Agent Session</h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-            Delegate a time-locked, budget-limited allowance key to your AI agent.
-          </p>
-
-          <div className="form-group">
-            <label>Agent Address</label>
-            <div style={{ display: 'flex', gap: '0.5rem' }}>
-              <input type="text" value={agentAddress} onChange={(e) => setAgentAddress(e.target.value)} style={{ flex: 1 }} />
-              <button onClick={handleGenerateAgent} className="btn-secondary" style={{ padding: '0.5rem 1rem', fontSize: '0.85rem' }}>
-                Generate
+          <section className="card console-card">
+            <div className="console-header">
+              <h2>Transaction Log</h2>
+              <button onClick={() => setLogs([])} className="btn-ghost" style={{ fontSize: '0.75rem' }}>Clear</button>
+            </div>
+            <div className="console-logs">
+              {logs.map((log, i) => (
+                <div key={i} className={`log-item log-${log.type}`}>[{log.timestamp}] {log.text}</div>
+              ))}
+              <div ref={consoleEndRef} />
+            </div>
+          </section>
+        </main>
+      ) : activeTab === "directory" ? (
+        <main style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div className="card">
+            <div className="search-bar">
+              <input
+                type="text"
+                placeholder="Search by name, service ID, or provider..."
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+              />
+              <button onClick={() => fetchRegisteredServices()} className="btn-secondary" disabled={fetchingServices || !account}>
+                {fetchingServices ? "Loading..." : "Refresh"}
               </button>
             </div>
           </div>
 
-          <div className="form-group">
-            <label>Allowance (in USDC units)</label>
-            <input type="number" value={agentAllowance} onChange={(e) => setAgentAllowance(e.target.value)} />
+          {fetchingServices ? (
+            <div className="empty-state">Querying Arbitrum Sepolia...</div>
+          ) : filteredServices.length === 0 ? (
+            <div className="empty-state">{account ? "No services found." : "Connect your wallet to browse services."}</div>
+          ) : (
+            <div className="grid">
+              {filteredServices.map(srv => (
+                <div key={srv.serviceId} className="card service-card">
+                  <div className="service-card-header">
+                    <h3>{srv.name}</h3>
+                    <span className="price-tag">{(parseFloat(srv.price) / 1e6).toFixed(2)} USDC</span>
+                  </div>
+                  <div>
+                    <span className="field-label">Endpoint</span>
+                    <code className="field-value">{srv.url}</code>
+                  </div>
+                  <div>
+                    <span className="field-label">Service ID</span>
+                    <div className="copy-row">
+                      <code className="field-value">{srv.serviceId}</code>
+                      <button className="btn-secondary" onClick={() => { navigator.clipboard.writeText(srv.serviceId); addLog(`Copied: ${srv.serviceId}`, "info"); }}>Copy</button>
+                    </div>
+                  </div>
+                  <div>
+                    <span className="field-label">Provider</span>
+                    <code className="field-value">{srv.provider}</code>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </main>
+      ) : activeTab === "activity" ? (
+        <main style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
+          <div className="stat-grid">
+            <div className="stat-card">
+              <span className="stat-value">{activityStats.totalPayments}</span>
+              <span className="stat-label">Total Payments</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-value">{activityStats.totalVolume.toFixed(2)}</span>
+              <span className="stat-label">Volume (USDC)</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-value">{activityStats.uniqueUsers}</span>
+              <span className="stat-label">Unique Users</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-value">{activityStats.uniqueProviders}</span>
+              <span className="stat-label">Providers</span>
+            </div>
+            <div className="stat-card">
+              <span className="stat-value">{activityStats.totalServices}</span>
+              <span className="stat-label">Services</span>
+            </div>
           </div>
 
-          <div className="form-group">
-            <label>Session Duration (seconds)</label>
-            <input type="number" value={sessionDuration} onChange={(e) => setSessionDuration(e.target.value)} />
-          </div>
+          <div className="card">
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2>Recent Transactions</h2>
+              <button onClick={() => fetchActivity()} className="btn-secondary" disabled={fetchingActivity || !account} style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}>
+                {fetchingActivity ? "Loading..." : "Refresh"}
+              </button>
+            </div>
 
-          <div style={{ display: 'flex', gap: '0.5rem' }}>
-            <button onClick={handleApproveAgent} className="btn-secondary" style={{ flex: 1 }} disabled={loading || !account}>
-              Approve Agent Session
-            </button>
-            <button onClick={handleApproveUSDC} className="btn-secondary" style={{ flex: 1 }} disabled={loading || !account}>
-              Approve USDC Spend
-            </button>
-          </div>
-        </section>
-
-        <section className="card">
-          <h2>Simulate Agent Payment</h2>
-          <p style={{ color: 'var(--text-secondary)', fontSize: '0.9rem' }}>
-            Trigger a manual payment using the connected wallet (acting as the agent key).
-          </p>
-
-          <div className="form-group">
-            <label>User Address (Delegator)</label>
-            <input type="text" value={payUserAddress} placeholder="0x..." onChange={(e) => setPayUserAddress(e.target.value)} />
-          </div>
-
-          <div className="form-group">
-            <label>Service ID</label>
-            <input type="text" value={payServiceID} placeholder="0x..." onChange={(e) => setPayServiceID(e.target.value)} />
-          </div>
-
-          <button onClick={handlePayForService} className="btn-secondary" disabled={loading || !account}>
-            Trigger Agent Payment
-          </button>
-        </section>
-
-        <section className="card console-card">
-          <div className="console-header">
-            <h2>Transaction Control Center</h2>
-            <button onClick={() => setLogs([])} className="btn-secondary" style={{ padding: '0.4rem 0.8rem', fontSize: '0.8rem' }}>
-              Clear Logs
-            </button>
-          </div>
-          
-          <div className="console-logs">
-            {logs.map((log, index) => (
-              <div key={index} className={`log-item log-${log.type}`}>
-                [{log.timestamp}] {log.text}
+            {fetchingActivity ? (
+              <div className="empty-state">Querying on-chain events...</div>
+            ) : !account ? (
+              <div className="empty-state">Connect your wallet to view activity.</div>
+            ) : recentTxns.length === 0 ? (
+              <div className="empty-state">No transactions found yet.</div>
+            ) : (
+              <div className="txn-list">
+                {recentTxns.map((tx, i) => (
+                  <div key={`${tx.hash}-${i}`} className="txn-row">
+                    <div className="txn-left">
+                      <span className={`txn-badge txn-${tx.type}`}>
+                        {tx.type === 'payment' ? 'Payment' : tx.type === 'approval' ? 'Approval' : 'Register'}
+                      </span>
+                      <div className="txn-details">
+                        {tx.type === 'payment' ? (
+                          <span>{tx.from.substring(0,6)}...{tx.from.substring(38)} → {tx.to.substring(0,6)}...{tx.to.substring(38)}</span>
+                        ) : tx.type === 'approval' ? (
+                          <span>{tx.from.substring(0,6)}...{tx.from.substring(38)} approved {tx.to.substring(0,6)}...{tx.to.substring(38)}</span>
+                        ) : (
+                          <span>{tx.from.substring(0,6)}...{tx.from.substring(38)} registered "{tx.name}"</span>
+                        )}
+                        <a href={`https://sepolia.arbiscan.io/tx/${tx.hash}`} target="_blank" rel="noopener noreferrer" className="txn-hash">{tx.hash.substring(0,10)}...</a>
+                      </div>
+                    </div>
+                    {tx.amount && <span className="txn-amount">{tx.amount} USDC</span>}
+                  </div>
+                ))}
               </div>
-            ))}
-            <div ref={consoleEndRef} />
+            )}
           </div>
-        </section>
-      </main>
+        </main>
+      ) : null}
     </div>
   );
 }
