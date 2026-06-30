@@ -278,6 +278,7 @@ function App() {
     <div className="container">
       <header>
         <div className="header-left">
+          <img src="/logo.png" alt="AgentPayOS Logo" style={{ width: '36px', height: '36px', borderRadius: '50%' }} />
           <h1>AgentPayOS</h1>
           <span className="badge">Arbitrum Stylus</span>
         </div>
