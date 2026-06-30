@@ -1,0 +1,17 @@
+{
+  "name": "agentpayos-sdk",
+  "version": "1.0.0",
+  "description": "TypeScript SDK for AgentPayOS ecosystem",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "example": "tsc && node dist/example.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2"
+  }
+}
