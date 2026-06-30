@@ -20,10 +20,6 @@ type Config struct {
 	UpstreamURL  string
 	RPCURL       string
 	ContractAddr string
-	ServiceID    string
-	ProviderAddr string
-	Price        *big.Int
-	PaymentToken string
 }
 
 type ProxyServer struct {
@@ -54,12 +50,20 @@ func NewProxyServer(config Config, cache *TxCache) (*ProxyServer, error) {
 
 var paymentProcessedSigHash = crypto.Keccak256Hash([]byte("PaymentProcessed(bytes32,address,address,address,uint256)"))
 
+type PaymentInfo struct {
+	ServiceID string
+	User      string
+	Agent     string
+	Provider  string
+	Amount    string
+}
+
 func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	txHashStr := r.Header.Get("X-Payment-Tx-Hash")
 	userAddrStr := r.Header.Get("X-User-Address")
 
 	if txHashStr == "" || userAddrStr == "" {
-		p.respondWithPaymentRequired(w, "Missing transaction hash or user address header")
+		p.respondWithError(w, http.StatusPaymentRequired, "Missing transaction hash or user address header")
 		return
 	}
 
@@ -70,36 +74,40 @@ func (p *ProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	userAddr := common.HexToAddress(userAddrStr)
 
 	if p.cache.IsSpent(txHashStr) {
-		p.respondWithPaymentRequired(w, "Transaction hash has already been spent (replay protection)")
+		p.respondWithError(w, http.StatusPaymentRequired, "Transaction hash has already been spent")
 		return
 	}
 
-	err := p.verifyPayment(r.Context(), txHash, userAddr)
+	payInfo, err := p.verifyPayment(r.Context(), txHash, userAddr)
 	if err != nil {
 		log.Printf("Payment verification failed: %v", err)
-		p.respondWithPaymentRequired(w, fmt.Sprintf("Payment verification failed: %v", err))
+		p.respondWithError(w, http.StatusPaymentRequired, fmt.Sprintf("Payment verification failed: %v", err))
 		return
 	}
 
 	p.cache.Spend(txHashStr)
+
+	r.Header.Set("X-Verified-Service-Id", payInfo.ServiceID)
+	r.Header.Set("X-Verified-User-Address", payInfo.User)
+	r.Header.Set("X-Verified-Agent-Address", payInfo.Agent)
+	r.Header.Set("X-Verified-Provider-Address", payInfo.Provider)
+	r.Header.Set("X-Verified-Amount", payInfo.Amount)
+
 	p.proxy.ServeHTTP(w, r)
 }
 
-func (p *ProxyServer) verifyPayment(ctx context.Context, txHash common.Hash, user common.Address) error {
+func (p *ProxyServer) verifyPayment(ctx context.Context, txHash common.Hash, user common.Address) (*PaymentInfo, error) {
 	receipt, err := p.client.TransactionReceipt(ctx, txHash)
 	if err != nil {
-		return fmt.Errorf("failed to fetch transaction receipt: %v", err)
+		return nil, fmt.Errorf("failed to fetch transaction receipt: %v", err)
 	}
 
 	if receipt.Status != 1 {
-		return fmt.Errorf("transaction failed on-chain")
+		return nil, fmt.Errorf("transaction failed on-chain")
 	}
 
 	contractAddress := common.HexToAddress(p.config.ContractAddr)
-	serviceIDBytes := common.HexToHash(p.config.ServiceID)
-	providerAddress := common.HexToAddress(p.config.ProviderAddr)
-
-	var validEventFound bool
+	var payInfo *PaymentInfo
 
 	for _, logEntry := range receipt.Logs {
 		if logEntry.Address != contractAddress {
@@ -112,9 +120,6 @@ func (p *ProxyServer) verifyPayment(ctx context.Context, txHash common.Hash, use
 		eventServiceID := logEntry.Topics[1]
 		eventUser := common.BytesToAddress(logEntry.Topics[2].Bytes())
 
-		if eventServiceID != serviceIDBytes {
-			continue
-		}
 		if eventUser != user {
 			continue
 		}
@@ -123,39 +128,35 @@ func (p *ProxyServer) verifyPayment(ctx context.Context, txHash common.Hash, use
 			continue
 		}
 
+		eventAgent := common.BytesToAddress(logEntry.Data[0:32])
 		eventProvider := common.BytesToAddress(logEntry.Data[32:64])
 		eventAmount := new(big.Int).SetBytes(logEntry.Data[64:96])
 
-		if eventProvider != providerAddress {
-			continue
+		payInfo = &PaymentInfo{
+			ServiceID: eventServiceID.Hex(),
+			User:      eventUser.Hex(),
+			Agent:     eventAgent.Hex(),
+			Provider:  eventProvider.Hex(),
+			Amount:    eventAmount.String(),
 		}
-		if eventAmount.Cmp(p.config.Price) < 0 {
-			return fmt.Errorf("transaction amount (%s) is less than required price (%s)", eventAmount.String(), p.config.Price.String())
-		}
-
-		validEventFound = true
 		break
 	}
 
-	if !validEventFound {
-		return fmt.Errorf("matching PaymentProcessed event not found in logs")
+	if payInfo == nil {
+		return nil, fmt.Errorf("matching PaymentProcessed event not found in logs")
 	}
 
-	return nil
+	return payInfo, nil
 }
 
-func (p *ProxyServer) respondWithPaymentRequired(w http.ResponseWriter, reason string) {
+func (p *ProxyServer) respondWithError(w http.ResponseWriter, statusCode int, reason string) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusPaymentRequired)
+	w.WriteHeader(statusCode)
 
 	response := map[string]interface{}{
-		"error":       "Payment Required",
-		"reason":      reason,
-		"service_id":  p.config.ServiceID,
-		"price":       p.config.Price.String(),
-		"token":       p.config.PaymentToken,
-		"recipient":   p.config.ProviderAddr,
-		"contract":    p.config.ContractAddr,
+		"error":    "Payment Required",
+		"reason":   reason,
+		"contract": p.config.ContractAddr,
 	}
 
 	json.NewEncoder(w).Encode(response)
