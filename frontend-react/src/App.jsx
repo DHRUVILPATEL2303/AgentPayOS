@@ -1,16 +1,17 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ethers } from 'ethers';
 
-const CONTRACT_ADDRESS = "0x7e56360fc8b6190abe5ecba15bc6a23683441c46";
+const CONTRACT_ADDRESS = "0x262dd88d9120275e9e9dc659c66cf5f5c4e826c8";
 
 const CONTRACT_ABI = [
-  "function registerService(string calldata name, uint256 price, address token) external returns (bytes32)",
+  "function registerService(string calldata name, uint256 price, address token, string calldata url) external returns (bytes32)",
+  "function getServiceUrl(bytes32 service_id) external view returns (string)",
   "function deactivateService(bytes32 service_id) external",
   "function reactivateService(bytes32 service_id) external",
   "function approveAgent(address agent, uint256 allowance, uint256 duration_seconds) external",
   "function payForService(address user, bytes32 service_id) external",
   "function computeSessionKey(address user, address agent) external view returns (bytes32)",
-  "event ServiceRegistered(bytes32 indexed service_id, address indexed provider, address indexed token, string name, uint256 price)",
+  "event ServiceRegistered(bytes32 indexed service_id, address indexed provider, address indexed token, string name, uint256 price, string url)",
   "event AgentApproved(address indexed user, address indexed agent, uint256 allowance, uint256 expiration)",
   "event PaymentProcessed(bytes32 indexed service_id, address indexed user, address agent, address provider, uint256 amount)"
 ];
@@ -27,6 +28,7 @@ function App() {
   const [serviceName, setServiceName] = useState("Weather Telemetry API");
   const [servicePrice, setServicePrice] = useState("1000000");
   const [tokenAddress, setTokenAddress] = useState("0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d");
+  const [serviceUrl, setServiceUrl] = useState("http://localhost:8080/");
 
   const [agentAddress, setAgentAddress] = useState("0x141C22D955f5dF0f54bffD8695CDC7e92b38551c");
   const [agentAllowance, setAgentAllowance] = useState("5000000");
@@ -113,7 +115,7 @@ function App() {
       addLog("Wallet not connected.", "error");
       return;
     }
-    if (!serviceName || !servicePrice || !tokenAddress) {
+    if (!serviceName || !servicePrice || !tokenAddress || !serviceUrl) {
       addLog("Please fill in all service registration inputs.", "error");
       return;
     }
@@ -121,9 +123,9 @@ function App() {
     try {
       setLoading(true);
       const price = ethers.toBigInt(servicePrice);
-      addLog(`Submitting registerService("${serviceName}", ${price}, ${tokenAddress})...`, "info");
+      addLog(`Submitting registerService("${serviceName}", ${price}, ${tokenAddress}, "${serviceUrl}")...`, "info");
       
-      const tx = await contract.registerService(serviceName, price, tokenAddress, {
+      const tx = await contract.registerService(serviceName, price, tokenAddress, serviceUrl, {
         maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
         maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
       });
@@ -305,6 +307,11 @@ function App() {
           <div className="form-group">
             <label>Token Address (USDC)</label>
             <input type="text" value={tokenAddress} onChange={(e) => setTokenAddress(e.target.value)} />
+          </div>
+
+          <div className="form-group">
+            <label>API Endpoint URL</label>
+            <input type="text" value={serviceUrl} onChange={(e) => setServiceUrl(e.target.value)} />
           </div>
 
           <button onClick={handleRegisterService} className="btn-secondary" disabled={loading || !account}>

@@ -6,6 +6,7 @@ use stylus_sdk::{
     alloy_sol_types::*,
     crypto::keccak,
     prelude::{errors::MethodError, *},
+    storage::StorageString,
 };
 
 sol_interface! {
@@ -15,7 +16,7 @@ sol_interface! {
 }
 
 sol! {
-    event ServiceRegistered(bytes32 indexed service_id, address indexed provider, address indexed token, string name, uint256 price);
+    event ServiceRegistered(bytes32 indexed service_id, address indexed provider, address indexed token, string name, uint256 price, string url);
     event AgentApproved(address indexed user, address indexed agent, uint256 allowance, uint256 expiration);
     event PaymentProcessed(bytes32 indexed service_id, address indexed user, address agent, address provider, uint256 amount);
 
@@ -33,6 +34,7 @@ sol_storage! {
         mapping(bytes32 => uint256) prices;
         mapping(bytes32 => bool) is_service_active;
         mapping(bytes32 => address) service_tokens;
+        mapping(bytes32 => StorageString) service_endpoints;
 
         // session based allowances to agents
         mapping(bytes32 => uint256) agent_allowances;
@@ -47,6 +49,7 @@ impl AgentPayOS {
         name: String,
         price: U256,
         token: Address,
+        url: String,
     ) -> Result<FixedBytes<32>, Vec<u8>> {
         let sender = self.vm().msg_sender();
         let mut packed = Vec::new();
@@ -57,6 +60,7 @@ impl AgentPayOS {
         self.service_providers.setter(service_id).set(sender);
         self.prices.setter(service_id).set(price);
         self.service_tokens.setter(service_id).set(token);
+        self.service_endpoints.setter(service_id).set_str(url.clone());
         self.is_service_active.setter(service_id).set(true);
 
         self.vm().log(ServiceRegistered {
@@ -65,9 +69,14 @@ impl AgentPayOS {
             token,
             name,
             price,
+            url,
         });
 
         Ok(service_id)
+    }
+
+    pub fn get_service_url(&self, service_id: FixedBytes<32>) -> Result<String, Vec<u8>> {
+        Ok(self.service_endpoints.get(service_id).get_string())
     }
 
     pub fn deactivate_service(&mut self, service_id: FixedBytes<32>) -> Result<(), Vec<u8>> {
