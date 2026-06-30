@@ -43,6 +43,9 @@ function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [fetchingServices, setFetchingServices] = useState(false);
 
+  const [agentSessions, setAgentSessions] = useState([]);
+  const [fetchingSessionsList, setFetchingSessionsList] = useState(false);
+
   const [activityStats, setActivityStats] = useState({ totalPayments: 0, totalVolume: 0, uniqueUsers: 0, uniqueProviders: 0, totalServices: 0 });
   const [recentTxns, setRecentTxns] = useState([]);
   const [fetchingActivity, setFetchingActivity] = useState(false);
@@ -52,6 +55,84 @@ function App() {
 
   const addLog = (text, type = "info") => {
     setLogs(prev => [...prev, { timestamp: new Date().toLocaleTimeString(), text, type }]);
+  };
+
+  const fetchAgentSessions = async (ci, userAddress) => {
+    const c = ci || contract;
+    const user = userAddress || account;
+    if (!c || !user) return;
+    try {
+      setFetchingSessionsList(true);
+      const startBlock = 282600000;
+      const [approvals, payments] = await Promise.all([
+        c.queryFilter(c.filters.AgentApproved(user), startBlock),
+        c.queryFilter(c.filters.PaymentProcessed(null, user), startBlock)
+      ]);
+
+      const agentMap = {};
+      const sortedApprovals = [...approvals].sort((a, b) => a.blockNumber - b.blockNumber);
+      
+      sortedApprovals.forEach(evt => {
+        const agent = evt.args.agent.toLowerCase();
+        agentMap[agent] = {
+          agent: evt.args.agent,
+          initialAllowance: evt.args.allowance,
+          expiration: Number(evt.args.expiration),
+          blockNumber: evt.blockNumber,
+          hash: evt.transactionHash
+        };
+      });
+
+      const sessions = Object.values(agentMap).map(sess => {
+        const agentLower = sess.agent.toLowerCase();
+        const spent = payments
+          .filter(p => p.args.agent.toLowerCase() === agentLower && p.blockNumber >= sess.blockNumber)
+          .reduce((sum, p) => sum + p.args.amount, 0n);
+
+        const remaining = sess.initialAllowance > spent ? sess.initialAllowance - spent : 0n;
+        const nowSec = Math.floor(Date.now() / 1000);
+        const isExpired = nowSec > sess.expiration;
+
+        return {
+          ...sess,
+          remaining: remaining.toString(),
+          spent: spent.toString(),
+          isExpired,
+          status: isExpired ? "Expired" : (remaining === 0n ? "Depleted" : "Active")
+        };
+      });
+
+      sessions.sort((a, b) => {
+        if (a.isExpired !== b.isExpired) return a.isExpired ? 1 : -1;
+        return b.expiration - a.expiration;
+      });
+
+      setAgentSessions(sessions);
+    } catch (err) {
+      addLog(`Failed to query agent sessions: ${err.message}`, "error");
+    } finally {
+      setFetchingSessionsList(false);
+    }
+  };
+
+  const handleRevokeAgent = async (agentAddr) => {
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    try {
+      setLoading(true);
+      addLog(`Revoking agent session for ${agentAddr}...`, "info");
+      const tx = await contract.approveAgent(agentAddr, 0n, 0n, {
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
+        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+      });
+      addLog(`Revoke transaction sent: ${tx.hash}`, "info");
+      await tx.wait();
+      addLog(`Agent session revoked successfully!`, "success");
+      fetchAgentSessions();
+    } catch (err) {
+      addLog(`Revocation failed: ${err.message}`, "error");
+    } finally {
+      setLoading(false);
+    }
   };
 
   useEffect(() => {
@@ -179,6 +260,7 @@ function App() {
       setContract(inst); setAccount(addr);
       addLog(`Connected: ${addr}`, "success");
       fetchRegisteredServices(inst);
+      fetchAgentSessions(inst, addr);
     } catch (err) { addLog(`Connection failed: ${err.message}`, "error"); }
     finally { setLoading(false); }
   };
@@ -224,6 +306,7 @@ function App() {
       addLog("Agent session approved!", "success");
       const key = ethers.solidityPackedKeccak256(["address", "address"], [account, agentAddress]);
       addLog(`Session Key: ${key}`, "success");
+      fetchAgentSessions();
     } catch (err) { addLog(`Approval failed: ${err.message}`, "error"); }
     finally { setLoading(false); }
   };
@@ -271,6 +354,7 @@ function App() {
     setAccount("");
     setContract(null);
     setRegisteredServices([]);
+    setAgentSessions([]);
     addLog("Wallet disconnected.", "info");
   };
 
@@ -374,6 +458,57 @@ function App() {
               <input type="text" value={payServiceID} onChange={e => setPayServiceID(e.target.value)} placeholder="0x..." />
             </div>
             <button onClick={handlePayForService} className="btn-primary" disabled={loading || !account}>Trigger Payment</button>
+          </section>
+
+          <section className="card" style={{ gridColumn: '1 / -1' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2>Active Agent Sessions</h2>
+              <button onClick={() => fetchAgentSessions()} className="btn-secondary" disabled={fetchingSessionsList || !account} style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}>
+                {fetchingSessionsList ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+            <p className="card-description">Track or revoke time-locked budgets granted to agent wallets from this account.</p>
+
+            {fetchingSessionsList ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>Querying approvals...</div>
+            ) : !account ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>Connect wallet to view active sessions.</div>
+            ) : agentSessions.length === 0 ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>No approved agent sessions found.</div>
+            ) : (
+              <div className="txn-list">
+                {agentSessions.map((sess, i) => {
+                  const remainingUSDC = (parseFloat(sess.remaining) / 1e6).toFixed(2);
+                  const initialUSDC = (parseFloat(sess.initialAllowance) / 1e6).toFixed(2);
+                  const expiryDate = new Date(sess.expiration * 1000).toLocaleString();
+                  return (
+                    <div key={`${sess.agent}-${i}`} className="txn-row" style={{ padding: '1rem 0' }}>
+                      <div className="txn-left">
+                        <span className={`txn-badge ${sess.status === 'Active' ? 'txn-payment' : sess.status === 'Expired' ? 'txn-registration' : 'txn-approval'}`}>
+                          {sess.status}
+                        </span>
+                        <div className="txn-details">
+                          <span style={{ fontWeight: '500' }}>Agent: {sess.agent}</span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+                            Expires: {expiryDate} • Initial: {initialUSDC} USDC
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                        <span className="txn-amount" style={{ color: sess.status === 'Active' ? 'var(--green)' : 'var(--text-muted)' }}>
+                          {remainingUSDC} USDC left
+                        </span>
+                        {sess.status === 'Active' && (
+                          <button onClick={() => handleRevokeAgent(sess.agent)} className="btn-secondary" disabled={loading} style={{ fontSize: '0.75rem', padding: '0.35rem 0.75rem', borderColor: 'var(--red)', color: 'var(--red)' }}>
+                            Revoke
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           <section className="card console-card">
