@@ -1,1 +1,18 @@
 /target
+
+# Binaries
+gateway/gateway-bin
+dummy-backend/dummy-bin
+
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+
+# IDE and system files
+.DS_Store
+.idea/
+.vscode/
+*.log
