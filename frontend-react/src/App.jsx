@@ -46,6 +46,10 @@ function App() {
   const [agentSessions, setAgentSessions] = useState([]);
   const [fetchingSessionsList, setFetchingSessionsList] = useState(false);
 
+  const [myServices, setMyServices] = useState([]);
+  const [fetchingMyServices, setFetchingMyServices] = useState(false);
+  const [priceUpdateInputs, setPriceUpdateInputs] = useState({});
+
   const [activityStats, setActivityStats] = useState({ totalPayments: 0, totalVolume: 0, uniqueUsers: 0, uniqueProviders: 0, totalServices: 0 });
   const [recentTxns, setRecentTxns] = useState([]);
   const [fetchingActivity, setFetchingActivity] = useState(false);
@@ -130,6 +134,114 @@ function App() {
       fetchAgentSessions();
     } catch (err) {
       addLog(`Revocation failed: ${err.message}`, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchMyServices = async (ci, userAddress) => {
+    const c = ci || contract;
+    const user = userAddress || account;
+    if (!c || !user) return;
+    try {
+      setFetchingMyServices(true);
+      const startBlock = 282600000;
+      const filter = c.filters.ServiceRegistered(null, user);
+      const events = await c.queryFilter(filter, startBlock);
+      
+      const uniqueServices = {};
+      events.forEach(evt => {
+        const sid = evt.args.service_id;
+        uniqueServices[sid] = {
+          serviceId: sid,
+          name: evt.args.name,
+          provider: evt.args.provider,
+          token: evt.args.token,
+          price: evt.args.price.toString(),
+          url: evt.args.url,
+          blockNumber: evt.blockNumber
+        };
+      });
+
+      const list = await Promise.all(Object.values(uniqueServices).map(async (srv) => {
+        try {
+          const provider = c.runner.provider;
+          const paddedSlotActive = ethers.zeroPadValue(ethers.toBeHex(2), 32);
+          const slotActive = ethers.keccak256(ethers.concat([srv.serviceId, paddedSlotActive]));
+          const activeVal = await provider.getStorage(CONTRACT_ADDRESS, slotActive);
+          const isActive = BigInt(activeVal) !== 0n;
+
+          const paddedSlotPrice = ethers.zeroPadValue(ethers.toBeHex(1), 32);
+          const slotPrice = ethers.keccak256(ethers.concat([srv.serviceId, paddedSlotPrice]));
+          const priceVal = await provider.getStorage(CONTRACT_ADDRESS, slotPrice);
+          const currentPrice = BigInt(priceVal).toString();
+
+          return {
+            ...srv,
+            price: currentPrice,
+            isActive
+          };
+        } catch (err) {
+          return {
+            ...srv,
+            isActive: true
+          };
+        }
+      }));
+
+      setMyServices(list);
+    } catch (err) {
+      addLog(`Failed to query provider services: ${err.message}`, "error");
+    } finally {
+      setFetchingMyServices(false);
+    }
+  };
+
+  const handleToggleServiceActive = async (srv) => {
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    try {
+      setLoading(true);
+      const action = srv.isActive ? "Deactivating" : "Reactivating";
+      addLog(`${action} service "${srv.name}"...`, "info");
+      
+      const tx = srv.isActive 
+        ? await contract.deactivateService(srv.serviceId, {
+            maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
+            maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+          })
+        : await contract.reactivateService(srv.serviceId, {
+            maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
+            maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+          });
+
+      addLog(`Transaction sent: ${tx.hash}`, "info");
+      await tx.wait();
+      addLog(`Service updated successfully!`, "success");
+      fetchMyServices();
+    } catch (err) {
+      addLog(`Failed to update service: ${err.message}`, "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleUpdatePrice = async (srv, newPrice) => {
+    if (!contract) { addLog("Wallet not connected.", "error"); return; }
+    if (!newPrice) { addLog("Enter a valid price.", "error"); return; }
+    try {
+      setLoading(true);
+      const price = ethers.toBigInt(newPrice);
+      addLog(`Updating price for "${srv.name}" to ${price} USDC units...`, "info");
+      const tx = await contract.registerService(srv.name, price, srv.token, srv.url, {
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
+        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+      });
+      addLog(`Transaction sent: ${tx.hash}`, "info");
+      await tx.wait();
+      addLog(`Price updated successfully!`, "success");
+      fetchMyServices();
+    } catch (err) {
+      addLog(`Failed to update price: ${err.message}`, "error");
     } finally {
       setLoading(false);
     }
@@ -261,6 +373,7 @@ function App() {
       addLog(`Connected: ${addr}`, "success");
       fetchRegisteredServices(inst);
       fetchAgentSessions(inst, addr);
+      fetchMyServices(inst, addr);
     } catch (err) { addLog(`Connection failed: ${err.message}`, "error"); }
     finally { setLoading(false); }
   };
@@ -288,6 +401,7 @@ function App() {
       addLog(`Confirmed in block ${receipt.blockNumber}`, "success");
       const sid = ethers.solidityPackedKeccak256(["bytes", "address"], [ethers.toUtf8Bytes(serviceName), account]);
       addLog(`Service ID: ${sid}`, "success");
+      fetchMyServices();
     } catch (err) { addLog(`Registration failed: ${err.message}`, "error"); }
     finally { setLoading(false); }
   };
@@ -355,6 +469,7 @@ function App() {
     setContract(null);
     setRegisteredServices([]);
     setAgentSessions([]);
+    setMyServices([]);
     addLog("Wallet disconnected.", "info");
   };
 
@@ -458,6 +573,76 @@ function App() {
               <input type="text" value={payServiceID} onChange={e => setPayServiceID(e.target.value)} placeholder="0x..." />
             </div>
             <button onClick={handlePayForService} className="btn-primary" disabled={loading || !account}>Trigger Payment</button>
+          </section>
+
+          <section className="card" style={{ gridColumn: '1 / -1' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2>Manage My Services</h2>
+              <button onClick={() => fetchMyServices()} className="btn-secondary" disabled={fetchingMyServices || !account} style={{ fontSize: '0.8rem', padding: '0.4rem 0.8rem' }}>
+                {fetchingMyServices ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
+            <p className="card-description">Toggle active status or modify pricing for services you registered from this provider account.</p>
+
+            {fetchingMyServices ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>Querying services...</div>
+            ) : !account ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>Connect wallet to manage your services.</div>
+            ) : myServices.length === 0 ? (
+              <div className="empty-state" style={{ padding: '2rem' }}>You have not registered any services yet.</div>
+            ) : (
+              <div className="txn-list">
+                {myServices.map((srv, i) => {
+                  const formattedPrice = (parseFloat(srv.price) / 1e6).toFixed(2);
+                  const priceInputVal = priceUpdateInputs[srv.serviceId] ?? srv.price;
+                  return (
+                    <div key={`${srv.serviceId}-${i}`} className="txn-row" style={{ padding: '1rem 0', flexWrap: 'wrap', gap: '1rem' }}>
+                      <div className="txn-left" style={{ flex: 1, minWidth: '280px' }}>
+                        <span className={`txn-badge ${srv.isActive ? 'txn-payment' : 'txn-registration'}`}>
+                          {srv.isActive ? 'Active' : 'Inactive'}
+                        </span>
+                        <div className="txn-details">
+                          <span style={{ fontWeight: '500' }}>{srv.name}</span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: '0.78rem' }}>
+                            ID: {srv.serviceId}
+                          </span>
+                          <span style={{ color: 'var(--accent)', fontSize: '0.75rem', fontFamily: 'SF Mono, monospace' }}>
+                            Endpoint: {srv.url}
+                          </span>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                          <input 
+                            type="number" 
+                            value={priceInputVal} 
+                            onChange={e => setPriceUpdateInputs(prev => ({ ...prev, [srv.serviceId]: e.target.value }))}
+                            style={{ width: '120px', padding: '0.4rem 0.6rem', fontSize: '0.8rem' }}
+                            placeholder="Price"
+                          />
+                          <button 
+                            onClick={() => handleUpdatePrice(srv, priceUpdateInputs[srv.serviceId])}
+                            className="btn-secondary"
+                            disabled={loading || priceInputVal === srv.price}
+                            style={{ fontSize: '0.75rem', padding: '0.45rem 0.75rem' }}
+                          >
+                            Update Price
+                          </button>
+                        </div>
+                        <button 
+                          onClick={() => handleToggleServiceActive(srv)}
+                          className="btn-secondary"
+                          disabled={loading}
+                          style={{ fontSize: '0.75rem', padding: '0.45rem 0.75rem', borderColor: srv.isActive ? 'var(--red)' : 'var(--green)', color: srv.isActive ? 'var(--red)' : 'var(--green)' }}
+                        >
+                          {srv.isActive ? 'Deactivate' : 'Reactivate'}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </section>
 
           <section className="card" style={{ gridColumn: '1 / -1' }}>
