@@ -50,6 +50,13 @@ function App() {
   const [fetchingMyServices, setFetchingMyServices] = useState(false);
   const [priceUpdateInputs, setPriceUpdateInputs] = useState({});
 
+  const [pgAgentKey, setPgAgentKey] = useState("");
+  const [pgSelectedService, setPgSelectedService] = useState("");
+  const [pgPrompt, setPgPrompt] = useState("Get Weather Telemetry");
+  const [pgStatus, setPgStatus] = useState("idle"); 
+  const [pgLogs, setPgLogs] = useState([]);
+  const [pgResult, setPgResult] = useState("");
+
   const [activityStats, setActivityStats] = useState({ totalPayments: 0, totalVolume: 0, uniqueUsers: 0, uniqueProviders: 0, totalServices: 0 });
   const [recentTxns, setRecentTxns] = useState([]);
   const [fetchingActivity, setFetchingActivity] = useState(false);
@@ -444,9 +451,84 @@ function App() {
   const handleGenerateAgent = () => {
     const w = ethers.Wallet.createRandom();
     setAgentAddress(w.address);
+    setPgAgentKey(w.privateKey);
     addLog(`New Agent: ${w.address}`, "success");
     addLog(`Private Key: ${w.privateKey}`, "success");
     addLog("Save this private key for your agent client.", "info");
+  };
+
+  const handleRunSimulation = async () => {
+    if (!pgSelectedService) { addLog("Select a service first.", "error"); return; }
+    if (!pgAgentKey) { addLog("Enter the Agent Private Key.", "error"); return; }
+
+    setPgStatus("wallet-check");
+    setPgLogs(["[Simulator] Initializing agent client..."]);
+    setPgResult("");
+
+    try {
+      // 1. Wallet Check
+      const provider = contract.runner.provider;
+      const agentWallet = new ethers.Wallet(pgAgentKey, provider);
+      const agentAddress = agentWallet.address;
+      setPgLogs(prev => [...prev, `[Simulator] Agent address resolved: ${agentAddress}`]);
+      
+      const targetSrv = registeredServices.find(s => s.serviceId === pgSelectedService);
+      if (!targetSrv) throw new Error("Selected service details not loaded.");
+
+      setPgLogs(prev => [...prev, `[Simulator] Target service: "${targetSrv.name}"`]);
+      setPgLogs(prev => [...prev, `[Simulator] Target URL: ${targetSrv.url}`]);
+
+      // 2. Settle On-Chain Payment
+      setPgStatus("on-chain-pay");
+      setPgLogs(prev => [...prev, `[Simulator] Submitting payForService on contract...`]);
+      
+      const agentContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, agentWallet);
+      const tx = await agentContract.payForService(account, pgSelectedService, {
+        maxFeePerGas: ethers.parseUnits("0.5", "gwei"),
+        maxPriorityFeePerGas: ethers.parseUnits("0.05", "gwei")
+      });
+      
+      setPgLogs(prev => [...prev, `[Simulator] Transaction sent! Hash: ${tx.hash}`]);
+      setPgLogs(prev => [...prev, `[Simulator] Waiting for block confirmation...`]);
+      
+      const receipt = await tx.wait();
+      setPgLogs(prev => [...prev, `[Simulator] Confirmed in block ${receipt.blockNumber}!`]);
+
+      // 3. Proxy Gateway Call
+      setPgStatus("gateway-call");
+      setPgLogs(prev => [...prev, `[Simulator] Executing HTTP call to gateway: ${targetSrv.url}...`]);
+      
+      const response = await fetch(targetSrv.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Payment-Tx-Hash": tx.hash,
+          "X-User-Address": account
+        },
+        body: JSON.stringify({ prompt: pgPrompt })
+      });
+
+      setPgLogs(prev => [...prev, `[Simulator] Response status: ${response.status} ${response.statusText}`]);
+      
+      const text = await response.text();
+      let parsed = text;
+      try { parsed = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+
+      if (response.ok) {
+        // 4. Data Display
+        setPgStatus("done");
+        setPgResult(parsed);
+        setPgLogs(prev => [...prev, `[Simulator] Simulation successfully completed!`]);
+        addLog(`Simulation completed for ${targetSrv.name}`, "success");
+      } else {
+        throw new Error(`Gateway returned error: ${parsed}`);
+      }
+    } catch (err) {
+      setPgStatus("error");
+      setPgLogs(prev => [...prev, `[Simulator] Error: ${err.message}`]);
+      setPgResult(err.message);
+      addLog(`Simulation failed: ${err.message}`, "error");
+    }
   };
 
   const handleApproveUSDC = async () => {
@@ -513,6 +595,7 @@ function App() {
         <button className={`tab-btn ${activeTab === "dashboard" ? "active" : ""}`} onClick={() => setActiveTab("dashboard")}>Console</button>
         <button className={`tab-btn ${activeTab === "directory" ? "active" : ""}`} onClick={() => { setActiveTab("directory"); fetchRegisteredServices(); }}>Service Directory</button>
         <button className={`tab-btn ${activeTab === "activity" ? "active" : ""}`} onClick={() => { setActiveTab("activity"); fetchActivity(); }}>Activity</button>
+        <button className={`tab-btn ${activeTab === "playground" ? "active" : ""}`} onClick={() => { setActiveTab("playground"); fetchRegisteredServices(); }}>Playground</button>
       </div>
 
       {activeTab === "dashboard" ? (
@@ -821,6 +904,115 @@ function App() {
               </div>
             )}
           </div>
+        </main>
+      ) : activeTab === "playground" ? (
+        <main className="grid">
+          <section className="card" style={{ gridColumn: '1 / -1' }}>
+            <h2>Agent Playground Simulator</h2>
+            <p className="card-description">Simulate a request sent from an autonomous agent client to a paid API service using on-chain authorization.</p>
+            
+            <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '1rem', marginTop: '0.5rem' }}>
+              <div className="form-group">
+                <label>Target API Service</label>
+                <select 
+                  value={pgSelectedService} 
+                  onChange={e => setPgSelectedService(e.target.value)}
+                  style={{ background: 'var(--bg-input)', border: '1px solid var(--border-default)', borderRadius: '10px', padding: '0.7rem 0.85rem', color: 'var(--text-primary)', fontFamily: 'inherit', fontSize: '0.9rem' }}
+                >
+                  <option value="">-- Select Registered Service --</option>
+                  {registeredServices.map(s => (
+                    <option key={s.serviceId} value={s.serviceId}>{s.name} ({(parseFloat(s.price)/1e6).toFixed(2)} USDC)</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="form-group">
+                <label>Agent Private Key</label>
+                <input 
+                  type="password" 
+                  value={pgAgentKey} 
+                  onChange={e => setPgAgentKey(e.target.value)} 
+                  placeholder="0x... (generated agent key)" 
+                />
+              </div>
+            </div>
+
+            <div className="form-group" style={{ marginTop: '0.5rem' }}>
+              <label>Agent Query Prompt</label>
+              <input 
+                type="text" 
+                value={pgPrompt} 
+                onChange={e => setPgPrompt(e.target.value)} 
+                placeholder="Ask the API something..." 
+              />
+            </div>
+
+            <button 
+              onClick={handleRunSimulation} 
+              className="btn-primary" 
+              disabled={loading || !account || pgStatus === "wallet-check" || pgStatus === "on-chain-pay" || pgStatus === "gateway-call"}
+              style={{ alignSelf: 'flex-start', marginTop: '0.5rem' }}
+            >
+              Run End-to-End Simulation
+            </button>
+          </section>
+
+          {/* Flow Status Visualizer */}
+          <section className="card" style={{ gridColumn: '1 / -1' }}>
+            <h2>Simulation Progress Flow</h2>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem', padding: '1rem 0' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', opacity: pgStatus !== 'idle' ? 1 : 0.4 }}>
+                <span style={{ fontSize: '1.2rem' }}>
+                  {pgStatus === 'wallet-check' ? '⚡' : (['on-chain-pay', 'gateway-call', 'done', 'error'].includes(pgStatus) ? '✅' : '⚪')}
+                </span>
+                <span style={{ fontWeight: pgStatus === 'wallet-check' ? '600' : '400', fontSize: '0.9rem' }}>1. Wallet Check</span>
+              </div>
+              <div style={{ fontSize: '1.1rem', color: 'var(--text-muted)' }}>➔</div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', opacity: ['on-chain-pay', 'gateway-call', 'done', 'error'].includes(pgStatus) ? 1 : 0.4 }}>
+                <span style={{ fontSize: '1.2rem' }}>
+                  {pgStatus === 'on-chain-pay' ? '⚡' : (['gateway-call', 'done', 'error'].includes(pgStatus) && pgStatus !== 'error' ? '✅' : '⚪')}
+                </span>
+                <span style={{ fontWeight: pgStatus === 'on-chain-pay' ? '600' : '400', fontSize: '0.9rem' }}>2. Settle On-Chain Payment</span>
+              </div>
+              <div style={{ fontSize: '1.1rem', color: 'var(--text-muted)' }}>➔</div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', opacity: ['gateway-call', 'done', 'error'].includes(pgStatus) ? 1 : 0.4 }}>
+                <span style={{ fontSize: '1.2rem' }}>
+                  {pgStatus === 'gateway-call' ? '⚡' : (pgStatus === 'done' ? '✅' : '⚪')}
+                </span>
+                <span style={{ fontWeight: pgStatus === 'gateway-call' ? '600' : '400', fontSize: '0.9rem' }}>3. Proxy Gateway Call</span>
+              </div>
+              <div style={{ fontSize: '1.1rem', color: 'var(--text-muted)' }}>➔</div>
+
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', opacity: pgStatus === 'done' ? 1 : 0.4 }}>
+                <span style={{ fontSize: '1.2rem' }}>
+                  {pgStatus === 'done' ? '🎉' : '⚪'}
+                </span>
+                <span style={{ fontWeight: pgStatus === 'done' ? '600' : '400', fontSize: '0.9rem' }}>4. Data Display</span>
+              </div>
+            </div>
+
+            <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '0.5rem' }}>
+              <div className="form-group">
+                <label>Simulation Logs</label>
+                <div className="console-logs" style={{ height: '180px', maxHeight: '180px' }}>
+                  {pgLogs.map((l, i) => (
+                    <div key={i} className="log-item log-info" style={{ fontFamily: 'SF Mono, monospace', fontSize: '0.78rem' }}>{l}</div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label>Returned Gateway Response</label>
+                <div className="console-logs" style={{ height: '180px', maxHeight: '180px', background: 'rgba(0,0,0,0.4)', color: pgStatus === 'error' ? 'var(--red)' : 'var(--green)' }}>
+                  <pre style={{ margin: 0, fontFamily: 'SF Mono, monospace', fontSize: '0.78rem', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+                    {pgResult || 'Waiting for execution...'}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          </section>
         </main>
       ) : null}
     </div>
